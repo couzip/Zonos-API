@@ -111,16 +111,36 @@ class SpeechRequest(BaseModel):
     model: str = Field("Zyphra/Zonos-v0.1-transformer", description="Model to use")
     input: str = Field(..., max_length=500, description="Text to synthesize")
     voice: Optional[str] = Field(None, description="Voice ID or name to use")
-    speed: float = Field(1.0, ge=0.5, le=2.0, description="Speaking speed multiplier")
+    speaking_rate: float = Field(15.0, ge=5.0, le=30.0, description="Speaking rate (5.0-30.0)")
     language: str = Field("en-us", description="Language code")
     emotion: Optional[Dict[str, float]] = None
     response_format: str = Field("mp3", description="Audio format (mp3 or wav)")
     prefix_audio: Optional[str] = Field(None, description="Voice ID or name to use as audio prefix")
 
-    # New sampling parameters
+    # Sampling parameters
     top_k: Optional[int] = Field(None, ge=1, description="Top-K sampling: Limits selection to K most likely tokens")
     top_p: Optional[float] = Field(None, ge=0.0, le=1.0, description="Top-P (nucleus) sampling: Dynamically limits token selection")
     min_p: Optional[float] = Field(0.15, ge=0.0, le=1.0, description="Min-P sampling: Excludes tokens below probability threshold")
+    
+    # NovelAI Unified Sampler parameters
+    linear: Optional[float] = Field(0.5, ge=-2.0, le=2.0, description="Linear parameter for unified sampling")
+    confidence: Optional[float] = Field(0.4, ge=-2.0, le=2.0, description="Confidence parameter for unified sampling")
+    quadratic: Optional[float] = Field(0.0, ge=-2.0, le=2.0, description="Quadratic parameter for unified sampling")
+    
+    # Additional audio quality parameters
+    vq_score: Optional[float] = Field(0.78, ge=0.5, le=0.8, description="VQ Score")
+    fmax: Optional[float] = Field(24000.0, ge=0.0, le=24000.0, description="Maximum frequency (Hz)")
+    pitch_std: Optional[float] = Field(45.0, ge=0.0, le=300.0, description="Pitch standard deviation")
+    dnsmos_ovrl: Optional[float] = Field(4.0, ge=1.0, le=5.0, description="DNSMOS overall score")
+    
+    # Generation control parameters
+    cfg_scale: Optional[float] = Field(2.0, ge=1.0, le=5.0, description="CFG scale for generation")
+    seed: Optional[int] = Field(None, description="Random seed for reproducibility")
+    randomize_seed: Optional[bool] = Field(False, description="Whether to randomize the seed")
+    
+    # Conditioning parameters
+    speaker_noised: Optional[bool] = Field(False, description="Whether to denoise speaker")
+    unconditional_keys: Optional[List[str]] = Field(["emotion"], description="List of keys to make unconditional")
 
 class VoiceResponse(BaseModel):
     voice_id: str
@@ -136,8 +156,14 @@ async def create_speech(request: SpeechRequest):
     try:
         model = MODELS["transformer" if "transformer" in request.model else "hybrid"]
 
-        # Convert speed to speaking_rate (15.0 is default)
-        speaking_rate = 15.0 * request.speed
+        # Use speaking_rate directly
+        speaking_rate = request.speaking_rate
+
+        # Setup seed if provided
+        if request.seed is not None and not request.randomize_seed:
+            torch.manual_seed(request.seed)
+        elif request.randomize_seed:
+            torch.manual_seed(torch.randint(0, 2**32 - 1, (1,)).item())
 
         # Prepare emotion tensor if provided
         emotion_tensor = None
@@ -164,15 +190,35 @@ async def create_speech(request: SpeechRequest):
                     detail=f"Voice '{request.voice}' not found. Please check voice ID or name."
                 )
 
+        # Prepare VQ Score tensor if provided
+        vq_tensor = None
+        if request.vq_score is not None:
+            vq_tensor = torch.tensor([request.vq_score] * 8, device="cuda").unsqueeze(0)
+
+        # Get audio prefix if provided
+        audio_prefix_codes = None
+        if request.prefix_audio:
+            prefix_embedding = get_voice_embedding(request.prefix_audio)
+            if prefix_embedding is not None:
+                # Use the voice embedding as a prefix
+                # Note: This is simplified, you may need to adjust based on how your model handles prefix audio
+                audio_prefix_codes = prefix_embedding.unsqueeze(0)
+
         # Default conditioning parameters
+        unconditional_keys = request.unconditional_keys or ["emotion"]
         cond_dict = make_cond_dict(
             text=request.input,
             language=request.language,
             speaker=speaker_embedding,
             emotion=emotion_tensor,
+            vqscore_8=vq_tensor,
+            fmax=request.fmax,
+            pitch_std=request.pitch_std,
             speaking_rate=speaking_rate,
+            dnsmos_ovrl=request.dnsmos_ovrl,
+            speaker_noised=request.speaker_noised,
             device="cuda",
-            unconditional_keys=[] if request.emotion else ["emotion"]
+            unconditional_keys=unconditional_keys
         )
 
         conditioning = model.prepare_conditioning(cond_dict)
@@ -180,13 +226,19 @@ async def create_speech(request: SpeechRequest):
         # Build sampling parameters dictionary
         sampling_params = {}
 
-        # Add non-None parameters to the dictionary
-        if request.min_p is not None:
-            sampling_params['min_p'] = request.min_p
-        if request.top_k is not None:
-            sampling_params['top_k'] = request.top_k
-        if request.top_p is not None:
-            sampling_params['top_p'] = request.top_p
+        # NovelAI unified sampler parameters
+        if request.linear != 0.0:
+            sampling_params['linear'] = request.linear
+            sampling_params['conf'] = request.confidence
+            sampling_params['quad'] = request.quadratic
+        # Legacy sampling parameters
+        else:
+            if request.min_p is not None:
+                sampling_params['min_p'] = request.min_p
+            if request.top_k is not None:
+                sampling_params['top_k'] = request.top_k
+            if request.top_p is not None:
+                sampling_params['top_p'] = request.top_p
 
         # Use default min_p if no sampling parameters were provided
         if not sampling_params:
@@ -195,8 +247,9 @@ async def create_speech(request: SpeechRequest):
         # Generate audio
         codes = model.generate(
             prefix_conditioning=conditioning,
+            audio_prefix_codes=audio_prefix_codes,
             max_new_tokens=86 * 30,
-            cfg_scale=2.0,
+            cfg_scale=request.cfg_scale,
             batch_size=1,
             sampling_params=sampling_params
         )
